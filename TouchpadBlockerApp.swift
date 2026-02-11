@@ -25,6 +25,7 @@ class TouchpadManager {
     private let lock = NSLock()
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var keyMonitor: Any?
     
     var isEnabled = true {
         didSet {
@@ -41,15 +42,30 @@ class TouchpadManager {
     func startMonitoring() {
         if eventTap != nil { return }
         
+        // Add NSEvent monitor as a backup for IME handling
+        self.keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            self?.updateLastTypingTime(source: "NSEvent")
+        }
+        
         let eventMask = (1 << CGEventType.keyDown.rawValue) |
                         (1 << CGEventType.mouseMoved.rawValue) |
                         (1 << CGEventType.leftMouseDown.rawValue) |
                         (1 << CGEventType.rightMouseDown.rawValue) |
                         (1 << CGEventType.scrollWheel.rawValue) |
-                        (1 << CGEventType.leftMouseDragged.rawValue)
+                        (1 << CGEventType.leftMouseDragged.rawValue) |
+                        (1 << CGEventType.flagsChanged.rawValue)
         
         func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
             let manager = Unmanaged<TouchpadManager>.fromOpaque(refcon!).takeUnretainedValue()
+            
+            if type == .tapDisabledByTimeout {
+                print("[DEBUG] Event tap disabled by timeout, re-enabling...")
+                if let tap = manager.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+            
             return manager.handle(type: type, event: event)
         }
         
@@ -85,23 +101,38 @@ class TouchpadManager {
             // CFMachPortInvalidate(eventTap) // Optional, depending on if we want to reuse
             self.eventTap = nil
         }
+        
+        if let keyMonitor = keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+        
         print("Monitoring stopped")
     }
     
+    private func updateLastTypingTime(source: String) {
+        lock.lock()
+        lastTypingTime = Date()
+        lock.unlock()
+        print("[DEBUG] Typing detected via \(source) at \(lastTypingTime)")
+    }
+    
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        if type == .keyDown {
-            lock.lock()
-            lastTypingTime = Date()
-            lock.unlock()
+        if type == .keyDown || type == .flagsChanged {
+            updateLastTypingTime(source: type == .keyDown ? "CGEvent.KeyDown" : "CGEvent.FlagsChanged")
             return Unmanaged.passUnretained(event)
         }
         
         // Mouse events
         lock.lock()
-        let timeSinceTyping = Date().timeIntervalSince(lastTypingTime)
+        // Use a local copy of lastTypingTime to ensure consistency
+        let currentLastTypingTime = lastTypingTime
         lock.unlock()
         
+        let timeSinceTyping = Date().timeIntervalSince(currentLastTypingTime)
+        
         if timeSinceTyping < disableDelay {
+            print("[DEBUG] Blocking event type: \(type.rawValue), timeSinceTyping: \(timeSinceTyping)")
             return nil // Block event
         }
         
