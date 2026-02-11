@@ -9,7 +9,18 @@ let bundleIdentifier = "com.resty.touchpadblocker"
 class TouchpadManager {
     static let shared = TouchpadManager()
     
-    private let disableDelay: TimeInterval = 0.5
+    private let defaultDelay: TimeInterval = 0.5
+    
+    var disableDelay: TimeInterval {
+        get {
+            let val = UserDefaults.standard.double(forKey: "BlockDelay")
+            return val > 0 ? val : defaultDelay
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "BlockDelay")
+        }
+    }
+    
     private var lastTypingTime: Date = Date.distantPast
     private let lock = NSLock()
     private var eventTap: CFMachPort?
@@ -166,9 +177,172 @@ class AutoStartManager {
     }
 }
 
+// MARK: - Auto Update Manager
+struct VersionInfo: Codable {
+    let version: String
+    let download_url: String
+    let release_notes: String
+}
+
+class UpdateManager {
+    static let shared = UpdateManager()
+    private let versionURL = URL(string: "https://gitee.com/restyhap/TouchpadBlocker/raw/main/version.json")!
+    
+    func checkForUpdates(silent: Bool = true) {
+        URLSession.shared.dataTask(with: versionURL) { [weak self] data, _, error in
+            guard let data = data, error == nil else {
+                if !silent { self?.showError("Failed to check for updates.") }
+                return
+            }
+            
+            do {
+                let info = try JSONDecoder().decode(VersionInfo.self, from: data)
+                let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+                
+                if info.version.compare(currentVersion, options: .numeric) == .orderedDescending {
+                    self?.downloadUpdate(info: info)
+                } else if !silent {
+                    DispatchQueue.main.async {
+                        let alert = NSAlert()
+                        alert.messageText = "Up to Date"
+                        alert.informativeText = "You are using the latest version \(currentVersion)."
+                        alert.runModal()
+                    }
+                }
+            } catch {
+                if !silent { self?.showError("Invalid version data.") }
+            }
+        }.resume()
+    }
+    
+    private func downloadUpdate(info: VersionInfo) {
+        guard let url = URL(string: info.download_url) else { return }
+        
+        URLSession.shared.downloadTask(with: url) { location, _, error in
+            guard let location = location, error == nil else { return }
+            
+            let fileManager = FileManager.default
+            let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            
+            do {
+                try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                let zipPath = tempDir.appendingPathComponent("update.zip")
+                try fileManager.moveItem(at: location, to: zipPath)
+                
+                // Unzip
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+                process.arguments = ["-o", zipPath.path, "-d", tempDir.path]
+                try process.run()
+                process.waitUntilExit()
+                
+                // Find .app
+                let contents = try fileManager.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
+                if let appURL = contents.first(where: { $0.pathExtension == "app" }) {
+                    DispatchQueue.main.async {
+                        self.promptUpdate(newAppURL: appURL, info: info)
+                    }
+                }
+            } catch {
+                print("Update failed: \(error)")
+            }
+        }.resume()
+    }
+    
+    private func promptUpdate(newAppURL: URL, info: VersionInfo) {
+        let alert = NSAlert()
+        alert.messageText = "New Version Available"
+        alert.informativeText = "Version \(info.version) is ready. Restart to update?\n\n\(info.release_notes)"
+        alert.addButton(withTitle: "Restart & Update")
+        alert.addButton(withTitle: "Later")
+        
+        if alert.runModal() == .alertFirstButtonReturn {
+            performUpdate(newAppURL: newAppURL)
+        }
+    }
+    
+    private func performUpdate(newAppURL: URL) {
+        let currentAppURL = Bundle.main.bundleURL
+        let script = "sleep 1; rm -rf \"\(currentAppURL.path)\"; mv \"\(newAppURL.path)\" \"\(currentAppURL.path)\"; open \"\(currentAppURL.path)\""
+        
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        
+        do {
+            try process.run()
+            NSApplication.shared.terminate(nil)
+        } catch {
+            showError("Failed to launch update script.")
+        }
+    }
+    
+    private func showError(_ message: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Error"
+            alert.informativeText = message
+            alert.runModal()
+        }
+    }
+}
+
+// MARK: - Preferences Window
+class PreferencesWindowController: NSWindowController, NSWindowDelegate {
+    private var inputField: NSTextField!
+    
+    convenience init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 150),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Preferences"
+        window.center()
+        self.init(window: window)
+        window.delegate = self
+        setupUI()
+    }
+    
+    private func setupUI() {
+        guard let contentView = window?.contentView else { return }
+        
+        // Label
+        let label = NSTextField(labelWithString: "Block Delay (ms):")
+        label.frame = NSRect(x: 40, y: 90, width: 120, height: 20)
+        contentView.addSubview(label)
+        
+        // Input Field
+        inputField = NSTextField(frame: NSRect(x: 160, y: 90, width: 80, height: 22))
+        let currentDelayMs = Int(TouchpadManager.shared.disableDelay * 1000)
+        inputField.stringValue = "\(currentDelayMs)"
+        contentView.addSubview(inputField)
+        
+        // Save Button
+        let saveButton = NSButton(title: "Save", target: self, action: #selector(saveClicked))
+        saveButton.frame = NSRect(x: 110, y: 40, width: 80, height: 24)
+        contentView.addSubview(saveButton)
+    }
+    
+    @objc private func saveClicked() {
+        let valueStr = inputField.stringValue
+        if let ms = Double(valueStr), ms > 0 {
+            TouchpadManager.shared.disableDelay = ms / 1000.0
+            window?.close()
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Invalid Input"
+            alert.informativeText = "Please enter a valid positive number for delay in milliseconds."
+            alert.runModal()
+        }
+    }
+}
+
 // MARK: - App Delegate
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
+    var preferencesWindowController: PreferencesWindowController?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Setup Status Bar Item
@@ -189,6 +363,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Verify Accessibility Permissions
         checkPermissions()
+        
+        // Check for updates silently
+        UpdateManager.shared.checkForUpdates(silent: true)
     }
     
     func checkPermissions() {
@@ -225,11 +402,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem.separator())
         
+        // Preferences
+        let prefsItem = NSMenuItem(title: "Preferences...", action: #selector(openPreferences), keyEquivalent: ",")
+        prefsItem.target = self
+        menu.addItem(prefsItem)
+        
         // Auto Start
         let autoStartItem = NSMenuItem(title: "Start at Login", action: #selector(toggleAutoStart), keyEquivalent: "")
         autoStartItem.target = self
         autoStartItem.state = AutoStartManager.shared.isAutoStartEnabled ? .on : .off
         menu.addItem(autoStartItem)
+        
+        menu.addItem(NSMenuItem.separator())
+        
+        // Check for Updates
+        let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
         
         menu.addItem(NSMenuItem.separator())
         
@@ -251,9 +440,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateMenu()
     }
     
+    @objc func openPreferences() {
+        if preferencesWindowController == nil {
+            preferencesWindowController = PreferencesWindowController()
+        }
+        preferencesWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    
     @objc func toggleAutoStart() {
         AutoStartManager.shared.toggleAutoStart()
         updateMenu()
+    }
+    
+    @objc func checkForUpdates() {
+        UpdateManager.shared.checkForUpdates(silent: false)
     }
     
     @objc func quitApp() {
